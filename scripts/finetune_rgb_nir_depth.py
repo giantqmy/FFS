@@ -78,6 +78,20 @@ def index_files(directory: Path, suffix: str) -> dict[str, Path]:
     return {p.name.removesuffix(suffix): p for p in directory.glob(f"*{suffix}")}
 
 
+def index_sparse_depth_files(directory: Path) -> dict[str, Path]:
+    suffixes = (
+        "_depth_gt_sparse_u16.png",
+        "_depth_sparse_u16.png",
+        "_depth_raw_u16.png",
+        "_depth_gt_u16.png",
+        "_depth_dense_u16.png",
+    )
+    indexed = {}
+    for suffix in suffixes:
+        indexed.update(index_files(directory, suffix))
+    return indexed
+
+
 class RGBNIRDenseDepthDataset(Dataset):
     def __init__(
         self,
@@ -87,16 +101,22 @@ class RGBNIRDenseDepthDataset(Dataset):
         calibration: dict,
         max_disp: float,
         max_depth: float,
+        sparse_depth: bool = False,
     ) -> None:
         self.calibration = calibration
         self.max_disp = float(max_disp)
         self.max_depth = float(max_depth)
         rgb = index_files(rgb_dir, "_S0_rgb.png")
         nir = index_files(nir_dir, "_S0_nir.png")
-        depth = index_files(depth_dir, "_depth_dense_u16.png")
+        depth = (
+            index_sparse_depth_files(depth_dir)
+            if sparse_depth
+            else index_files(depth_dir, "_depth_dense_u16.png")
+        )
         keys = sorted(set(rgb) & set(nir) & set(depth))
         if not keys:
-            raise RuntimeError("No matching RGB/NIR/dense-depth timestamp prefixes found")
+            label = "sparse-depth" if sparse_depth else "dense-depth"
+            raise RuntimeError(f"No matching RGB/NIR/{label} timestamp prefixes found")
         self.samples = [(rgb[k], nir[k], depth[k], k) for k in keys]
         counts = {"RGB": len(rgb), "NIR": len(nir), "depth": len(depth), "matched": len(keys)}
         print(f"Dataset counts: {counts}", flush=True)
@@ -267,6 +287,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--valid-iters", type=int, default=8)
     parser.add_argument("--max-disp", type=int, default=192)
     parser.add_argument("--max-depth", type=float, default=200.0)
+    parser.add_argument("--sparse-depth", action="store_true", help="Use sparse LiDAR depth files and supervise only their nonzero pixels")
     parser.add_argument("--gamma", type=float, default=0.9)
     parser.add_argument("--depth-weight", type=float, default=1.0)
     parser.add_argument("--disp-weight", type=float, default=0.75)
@@ -289,7 +310,7 @@ def main() -> None:
     calibration = load_calibration(args.calibration_file)
     dataset = RGBNIRDenseDepthDataset(
         args.rgb_dir, args.nir_dir, args.depth_dir, calibration,
-        max_disp=args.max_disp, max_depth=args.max_depth,
+        max_disp=args.max_disp, max_depth=args.max_depth, sparse_depth=args.sparse_depth,
     )
     indices = list(range(len(dataset)))
     random.Random(args.seed).shuffle(indices)
@@ -370,7 +391,12 @@ def main() -> None:
         "output": str(args.output), "calibration_file": str(args.calibration_file),
         "depth_scale_m_per_uint16": DEPTH_METRES_PER_UINT16,
         "fx_rectified": calibration["fx"], "baseline_m": calibration["baseline"],
-        "supervision": "rectified dense depth; nonzero pixels only; depth and disparity sequence BerHu/SmoothL1",
+        "supervision": (
+            "rectified sparse LiDAR depth; original nonzero projected points only; "
+            "depth and disparity sequence BerHu/SmoothL1"
+            if args.sparse_depth
+            else "rectified dense depth; nonzero pixels only; depth and disparity sequence BerHu/SmoothL1"
+        ),
     }
     (args.output / "run_config.json").write_text(
         json.dumps(run_config, indent=2, ensure_ascii=False), encoding="utf-8"
