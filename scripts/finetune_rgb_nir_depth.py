@@ -102,17 +102,19 @@ class RGBNIRDenseDepthDataset(Dataset):
         max_disp: float,
         max_depth: float,
         sparse_depth: bool = False,
+        depth_suffix: str | None = None,
     ) -> None:
         self.calibration = calibration
         self.max_disp = float(max_disp)
         self.max_depth = float(max_depth)
         rgb = index_files(rgb_dir, "_S0_rgb.png")
         nir = index_files(nir_dir, "_S0_nir.png")
-        depth = (
-            index_sparse_depth_files(depth_dir)
-            if sparse_depth
-            else index_files(depth_dir, "_depth_dense_u16.png")
-        )
+        if depth_suffix is not None:
+            depth = index_files(depth_dir, depth_suffix)
+        elif sparse_depth:
+            depth = index_sparse_depth_files(depth_dir)
+        else:
+            depth = index_files(depth_dir, "_depth_dense_u16.png")
         keys = sorted(set(rgb) & set(nir) & set(depth))
         if not keys:
             label = "sparse-depth" if sparse_depth else "dense-depth"
@@ -288,6 +290,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-disp", type=int, default=192)
     parser.add_argument("--max-depth", type=float, default=200.0)
     parser.add_argument("--sparse-depth", action="store_true", help="Use sparse LiDAR depth files and supervise only their nonzero pixels")
+    parser.add_argument("--depth-suffix", type=str, help="Exact depth filename suffix, e.g. _depth_gt_sparse_u16.png")
     parser.add_argument("--gamma", type=float, default=0.9)
     parser.add_argument("--depth-weight", type=float, default=1.0)
     parser.add_argument("--disp-weight", type=float, default=0.75)
@@ -311,6 +314,7 @@ def main() -> None:
     dataset = RGBNIRDenseDepthDataset(
         args.rgb_dir, args.nir_dir, args.depth_dir, calibration,
         max_disp=args.max_disp, max_depth=args.max_depth, sparse_depth=args.sparse_depth,
+        depth_suffix=args.depth_suffix,
     )
     indices = list(range(len(dataset)))
     random.Random(args.seed).shuffle(indices)
