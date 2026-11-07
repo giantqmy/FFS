@@ -233,6 +233,22 @@ def save_manifest(path: Path, dataset: RGBNIRDenseDepthDataset, indices: list[in
             stream.write(f"{key}\t{rgb.resolve()}\t{nir.resolve()}\t{depth.resolve()}\n")
 
 
+def to_yamlable(value):
+    if isinstance(value, dict):
+        return {str(key): to_yamlable(item) for key, item in value.items()}
+    if isinstance(value, (list, tuple)):
+        return [to_yamlable(item) for item in value]
+    if isinstance(value, np.ndarray):
+        return to_yamlable(value.tolist())
+    if isinstance(value, np.generic):
+        return value.item()
+    if isinstance(value, Path):
+        return str(value)
+    if value is None or isinstance(value, (str, int, float, bool)):
+        return value
+    return str(value)
+
+
 def parse_args() -> argparse.Namespace:
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument("--rgb-dir", type=Path, default=DEFAULT_RGB)
@@ -242,6 +258,7 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--resume", type=Path)
     parser.add_argument("--output", type=Path, default=DEFAULT_OUTPUT)
+    parser.add_argument("--gpu", type=int, default=0, help="CUDA device index (default: 0)")
     parser.add_argument("--epochs", type=int, default=20)
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--workers", type=int, default=0)
@@ -303,8 +320,13 @@ def main() -> None:
         return
     if not torch.cuda.is_available():
         raise RuntimeError("Fast-FoundationStereo fine-tuning requires a CUDA GPU")
+    if args.gpu < 0 or args.gpu >= torch.cuda.device_count():
+        raise ValueError(
+            f"Invalid GPU index {args.gpu}; available CUDA devices: {torch.cuda.device_count()}"
+        )
 
-    device = torch.device("cuda")
+    torch.cuda.set_device(args.gpu)
+    device = torch.device(f"cuda:{args.gpu}")
     try:
         model = torch.load(args.model, map_location="cpu", weights_only=False)
     except ModuleNotFoundError as error:
@@ -314,9 +336,9 @@ def main() -> None:
         ) from error
     model.args.valid_iters = args.valid_iters
     model.args.max_disp = args.max_disp
-    model.cuda().train()
+    model.to(device).train()
     with (args.output / "cfg.yaml").open("w", encoding="utf-8") as stream:
-        yaml.safe_dump(dict(model.args), stream, sort_keys=False)
+        yaml.safe_dump(to_yamlable(dict(model.args)), stream, sort_keys=False)
     optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
     scaler = torch.amp.GradScaler("cuda", enabled=bool(model.args.mixed_precision))
     start_epoch = 0
