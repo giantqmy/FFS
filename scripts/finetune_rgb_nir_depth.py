@@ -260,6 +260,10 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--batch-size", type=int, default=1)
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-5)
+    parser.add_argument(
+        "--feature-lr", type=float,
+        help="Optional learning rate for model.feature; other modules use --lr",
+    )
     parser.add_argument("--weight-decay", type=float, default=1e-5)
     parser.add_argument("--valid-iters", type=int, default=22)
     parser.add_argument("--max-disp", type=int, default=192)
@@ -274,6 +278,8 @@ def parse_args() -> argparse.Namespace:
     args = parser.parse_args()
     if args.epochs < 1 or args.batch_size < 1 or args.lr <= 0:
         parser.error("epochs and batch-size must be >= 1; lr must be positive")
+    if args.feature_lr is not None and args.feature_lr <= 0:
+        parser.error("feature-lr must be positive when specified")
     if not 0.0 < args.val_fraction < 1.0:
         parser.error("val-fraction must be between 0 and 1")
     return args
@@ -336,7 +342,27 @@ def main() -> None:
     model.to(device).train()
     with (args.output / "cfg.yaml").open("w", encoding="utf-8") as stream:
         yaml.safe_dump(to_yamlable(dict(model.args)), stream, sort_keys=False)
-    optimizer = torch.optim.AdamW(model.parameters(), lr=args.lr, weight_decay=args.weight_decay)
+    if args.feature_lr is None:
+        optimizer = torch.optim.AdamW(
+            model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        )
+    else:
+        feature_params = list(model.feature.parameters())
+        feature_param_ids = {id(param) for param in feature_params}
+        stereo_params = [
+            param for param in model.parameters() if id(param) not in feature_param_ids
+        ]
+        optimizer = torch.optim.AdamW(
+            [
+                {"params": feature_params, "lr": args.feature_lr},
+                {"params": stereo_params, "lr": args.lr},
+            ],
+            weight_decay=args.weight_decay,
+        )
+        print(
+            f"Learning rates: feature={args.feature_lr:g}, "
+            f"stereo_modules={args.lr:g}", flush=True,
+        )
     scaler = torch.amp.GradScaler("cuda", enabled=bool(model.args.mixed_precision))
     start_epoch = 0
     best_val = float("inf")
