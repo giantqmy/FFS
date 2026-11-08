@@ -175,30 +175,12 @@ class RGBNIRDenseDepthDataset(Dataset):
         }
 
 
-def berhu(prediction: torch.Tensor, target: torch.Tensor, valid: torch.Tensor) -> torch.Tensor:
-    if not valid.any():
-        return prediction.sum() * 0.0
-    error = (prediction.float() - target.float()).abs()
-    threshold = (0.1 * error[valid].detach().max()).clamp(min=1e-4)
-    value = torch.where(
-        error <= threshold,
-        error,
-        (error.square() + threshold.square()) / (2.0 * threshold),
-    )
-    return value[valid].mean()
-
-
 def sequence_loss(
     init_disp: torch.Tensor,
     predictions: list[torch.Tensor],
-    gt_depth: torch.Tensor,
     gt_disp: torch.Tensor,
     valid: torch.Tensor,
-    focal_baseline: float,
     gamma: float,
-    depth_weight: float,
-    disp_weight: float,
-    init_weight: float,
 ) -> tuple[torch.Tensor, dict]:
     total = gt_disp.sum() * 0.0
     init_h, init_w = init_disp.shape[-2:]
@@ -206,27 +188,20 @@ def sequence_loss(
     init_gt = F.interpolate(gt_disp, size=(init_h, init_w), mode="nearest") * scale
     init_valid = F.interpolate(valid.float(), size=(init_h, init_w), mode="nearest") > 0.5
     init_loss = F.smooth_l1_loss(init_disp[init_valid], init_gt[init_valid]) if init_valid.any() else total
-    total = total + init_weight * init_loss
 
-    depth_total = total * 0.0
     disp_total = total * 0.0
     for index, prediction in enumerate(predictions):
         weight = gamma ** (len(predictions) - index - 1)
         finite = valid & torch.isfinite(prediction)
         if not finite.any():
             continue
-        disp_loss = F.smooth_l1_loss(prediction[finite].float(), gt_disp[finite].float())
-        # The disparity term supplies gradients when an early prediction is non-positive.
-        predicted_depth = focal_baseline / prediction.float().clamp(min=0.1)
-        depth_loss = berhu(predicted_depth, gt_depth, finite)
+        disp_loss = F.l1_loss(prediction[finite].float(), gt_disp[finite].float())
         disp_total = disp_total + weight * disp_loss
-        depth_total = depth_total + weight * depth_loss
-    total = total + disp_weight * disp_total + depth_weight * depth_total
+    total = init_loss + disp_total
     return total, {
         "loss": float(total.detach()),
         "loss_init_disp": float(init_loss.detach()),
         "loss_disp": float(disp_total.detach()),
-        "loss_depth": float(depth_total.detach()),
     }
 
 
@@ -286,15 +261,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--workers", type=int, default=0)
     parser.add_argument("--lr", type=float, default=1e-5)
     parser.add_argument("--weight-decay", type=float, default=1e-5)
-    parser.add_argument("--valid-iters", type=int, default=8)
+    parser.add_argument("--valid-iters", type=int, default=22)
     parser.add_argument("--max-disp", type=int, default=192)
     parser.add_argument("--max-depth", type=float, default=200.0)
     parser.add_argument("--sparse-depth", action="store_true", help="Use sparse LiDAR depth files and supervise only their nonzero pixels")
     parser.add_argument("--depth-suffix", type=str, help="Exact depth filename suffix, e.g. _depth_gt_sparse_u16.png")
     parser.add_argument("--gamma", type=float, default=0.9)
-    parser.add_argument("--depth-weight", type=float, default=1.0)
-    parser.add_argument("--disp-weight", type=float, default=0.75)
-    parser.add_argument("--init-weight", type=float, default=0.25)
     parser.add_argument("--val-fraction", type=float, default=0.1)
     parser.add_argument("--seed", type=int, default=17)
     parser.add_argument("--limit", type=int)
@@ -396,10 +368,11 @@ def main() -> None:
         "depth_scale_m_per_uint16": DEPTH_METRES_PER_UINT16,
         "fx_rectified": calibration["fx"], "baseline_m": calibration["baseline"],
         "supervision": (
-            "rectified sparse LiDAR depth; original nonzero projected points only; "
-            "depth and disparity sequence BerHu/SmoothL1"
+            "rectified sparse depth converted to disparity; nonzero valid labels only; "
+            "initial SmoothL1 plus gamma-weighted iterative L1 disparity loss"
             if args.sparse_depth
-            else "rectified dense depth; nonzero pixels only; depth and disparity sequence BerHu/SmoothL1"
+            else "rectified depth converted to disparity; nonzero valid labels only; "
+            "initial SmoothL1 plus gamma-weighted iterative L1 disparity loss"
         ),
     }
     (args.output / "run_config.json").write_text(
@@ -428,9 +401,7 @@ def main() -> None:
                         optimize_build_volume="pytorch1",
                     )
                     loss, details = sequence_loss(
-                        init_disp, predictions, gt_depth, gt_disp, valid,
-                        focal_baseline, args.gamma, args.depth_weight,
-                        args.disp_weight, args.init_weight,
+                        init_disp, predictions, gt_disp, valid, args.gamma,
                     )
                     if not torch.isfinite(loss):
                         raise FloatingPointError(f"Non-finite loss: {details}; keys={batch['key']}")
@@ -448,8 +419,8 @@ def main() -> None:
                     if step == 1 or step == len(loader) or step % 20 == 0:
                         print(
                             f"epoch {epoch + 1}/{args.epochs} {phase} {step}/{len(loader)} "
-                            f"loss={details['loss']:.6f} depth={details['loss_depth']:.6f} "
-                            f"disp={details['loss_disp']:.6f}", flush=True,
+                            f"loss={details['loss']:.6f} init_disp={details['loss_init_disp']:.6f} "
+                            f"iter_disp={details['loss_disp']:.6f}", flush=True,
                         )
             count = totals["count"]
             epoch_result[f"{phase}_loss"] = loss_sum / max(batches, 1)
