@@ -7,7 +7,6 @@ numpy
 scikit-image
 opencv-contrib-python
 imageio
-matplotlib
 pyyaml
 open3d
 

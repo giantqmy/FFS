@@ -10,7 +10,6 @@ from pathlib import Path
 
 import cv2
 import imageio.v2 as imageio
-import matplotlib
 import numpy as np
 import torch
 
@@ -70,6 +69,24 @@ def add_label(image: np.ndarray, label: str) -> np.ndarray:
         (255, 255, 255), 2, cv2.LINE_AA,
     )
     return labeled
+
+
+def colorize_depth_spectral(depth_norm: np.ndarray) -> np.ndarray:
+    """Apply a dependency-free approximation of Matplotlib's Spectral colormap."""
+    anchors = np.asarray(
+        [
+            [158, 1, 66], [213, 62, 79], [244, 109, 67],
+            [253, 174, 97], [254, 224, 139], [255, 255, 191],
+            [230, 245, 152], [171, 221, 164], [102, 194, 165],
+            [50, 136, 189], [94, 79, 162],
+        ],
+        dtype=np.float32,
+    )
+    position = np.clip(depth_norm, 0.0, 1.0) * (len(anchors) - 1)
+    lower = np.floor(position).astype(np.int32)
+    upper = np.minimum(lower + 1, len(anchors) - 1)
+    fraction = (position - lower)[..., None]
+    return np.rint(anchors[lower] * (1.0 - fraction) + anchors[upper] * fraction).astype(np.uint8)
 
 
 def infer_pair(model, left_raw, right_raw, calibration, device, args):
@@ -155,7 +172,7 @@ def save_pair(out_dir: Path, key: str, result, args) -> dict:
         if depth_max <= depth_min:
             depth_max = depth_min + 1e-6
         depth_norm = np.clip((depth_m - depth_min) / (depth_max - depth_min), 0.0, 1.0)
-        depth_rgb = (matplotlib.colormaps["Spectral"](depth_norm)[..., :3] * 255.0).astype(np.uint8)
+        depth_rgb = colorize_depth_spectral(depth_norm)
         depth_rgb[~valid] = 0
     else:
         depth_min, depth_max = 0.0, 1.0
