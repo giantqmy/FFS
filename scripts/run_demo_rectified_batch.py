@@ -10,6 +10,7 @@ from pathlib import Path
 
 import cv2
 import imageio.v2 as imageio
+import matplotlib
 import numpy as np
 import torch
 
@@ -45,6 +46,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-disp", type=int, default=192)
     parser.add_argument("--min-disp-vis", type=float, default=None)
     parser.add_argument("--max-disp-vis", type=float, default=None)
+    parser.add_argument("--min-depth-vis", type=float, default=None)
+    parser.add_argument("--max-depth-vis", type=float, default=None)
     parser.add_argument("--limit", type=int, default=None)
     parser.add_argument("--keep-invisible", action="store_true")
     return parser.parse_args()
@@ -54,6 +57,19 @@ def index_images(directory: Path, suffix: str) -> dict[str, Path]:
     if not directory.is_dir():
         raise NotADirectoryError(f"Input directory does not exist: {directory}")
     return {path.name[:-len(suffix)]: path for path in directory.glob(f"*{suffix}")}
+
+
+def add_label(image: np.ndarray, label: str) -> np.ndarray:
+    labeled = image.copy()
+    cv2.putText(
+        labeled, label, (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+        (0, 0, 0), 4, cv2.LINE_AA,
+    )
+    cv2.putText(
+        labeled, label, (12, 30), cv2.FONT_HERSHEY_SIMPLEX, 0.8,
+        (255, 255, 255), 2, cv2.LINE_AA,
+    )
+    return labeled
 
 
 def infer_pair(model, left_raw, right_raw, calibration, device, args):
@@ -93,7 +109,7 @@ def save_pair(out_dir: Path, key: str, result, args) -> dict:
     left, right, disparity, valid, depth_m, fx_rectified, baseline_m = result
     folders = {
         name: out_dir / name
-        for name in ("rectified", "disparity", "depth", "preview", "masks")
+        for name in ("rectified", "disparity", "depth", "depth_vis", "preview", "masks")
     }
     for folder in folders.values():
         folder.mkdir(parents=True, exist_ok=True)
@@ -124,14 +140,40 @@ def save_pair(out_dir: Path, key: str, result, args) -> dict:
         color_map=cv2.COLORMAP_TURBO,
     )
     imageio.imwrite(folders["disparity"] / f"{key}_disp_vis.png", disp_vis)
-    imageio.imwrite(
-        folders["preview"] / f"{key}_rgb_nir_disp.png",
-        np.concatenate([left, right, disp_vis], axis=1),
-    )
 
     np.save(folders["depth"] / f"{key}_depth_m.npy", depth_m)
     depth_u16 = np.clip(depth_m * 256.0, 0, 65535).astype(np.uint16)
     imageio.imwrite(folders["depth"] / f"{key}_depth_m_x256_u16.png", depth_u16)
+
+    if valid.any():
+        if args.min_depth_vis is None or args.max_depth_vis is None:
+            pmin, pmax = np.percentile(depth_m[valid], [2.0, 98.0])
+            depth_min = pmin if args.min_depth_vis is None else args.min_depth_vis
+            depth_max = pmax if args.max_depth_vis is None else args.max_depth_vis
+        else:
+            depth_min, depth_max = args.min_depth_vis, args.max_depth_vis
+        if depth_max <= depth_min:
+            depth_max = depth_min + 1e-6
+        depth_norm = np.clip((depth_m - depth_min) / (depth_max - depth_min), 0.0, 1.0)
+        depth_rgb = (matplotlib.colormaps["Spectral"](depth_norm)[..., :3] * 255.0).astype(np.uint8)
+        depth_rgb[~valid] = 0
+    else:
+        depth_min, depth_max = 0.0, 1.0
+        depth_rgb = np.zeros((*depth_m.shape, 3), dtype=np.uint8)
+    imageio.imwrite(folders["depth_vis"] / f"{key}_depth_color.png", depth_rgb)
+    comparison = np.concatenate(
+        [
+            add_label(left, "RGB"),
+            add_label(right, "NIR"),
+            add_label(disp_vis, "Disparity"),
+            add_label(depth_rgb, "Depth"),
+        ],
+        axis=1,
+    )
+    imageio.imwrite(
+        folders["preview"] / f"{key}_rgb_nir_disp_depth.png",
+        comparison,
+    )
     return {
         "key": key,
         "valid_pixels": int(valid.sum()),
@@ -140,6 +182,12 @@ def save_pair(out_dir: Path, key: str, result, args) -> dict:
         "fx_times_baseline_px_m": fx_rectified * baseline_m,
         "depth_formula": "depth_m = fx_rectified_px * baseline_m / disparity_pixels",
         "depth_png_encoding": "uint16 = round(depth_m * 256); zero invalid; saturates at 255.996 m",
+        "depth_visualization": {
+            "colormap": "Spectral",
+            "min_depth_m": float(depth_min),
+            "max_depth_m": float(depth_max),
+            "range_method": "user-specified bounds or valid-pixel 2nd/98th percentiles",
+        },
     }
 
 
@@ -153,6 +201,10 @@ def main() -> None:
         )
     if (args.min_disp_vis is None) != (args.max_disp_vis is None):
         raise ValueError("Set both --min-disp-vis and --max-disp-vis, or neither")
+    if (args.min_depth_vis is None) != (args.max_depth_vis is None):
+        raise ValueError("Set both --min-depth-vis and --max-depth-vis, or neither")
+    if args.min_depth_vis is not None and args.max_depth_vis <= args.min_depth_vis:
+        raise ValueError("--max-depth-vis must be greater than --min-depth-vis")
 
     torch.cuda.set_device(args.gpu)
     device = torch.device(f"cuda:{args.gpu}")
