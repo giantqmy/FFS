@@ -45,7 +45,7 @@ def ensure_three_channels(image, label):
     raise ValueError(f"{label} must be HxW grayscale or HxWxC; got {image.shape}")
 
 
-def load_calibration(path):
+def load_calibration(path, alpha_override=None):
     with open(path, "r", encoding="utf-8") as stream:
         data = json.load(stream)
 
@@ -73,7 +73,7 @@ def load_calibration(path):
     translation = np.asarray(
         data["T_left_to_right_m"], dtype=np.float64
     ).reshape(3, 1)
-    alpha = float(data.get("alpha", 0.9))
+    alpha = float(data.get("alpha", 0.9) if alpha_override is None else alpha_override)
 
     R1, R2, P1, P2, Q, roi_left, roi_right = cv2.stereoRectify(
         K_left,
@@ -106,6 +106,7 @@ def load_calibration(path):
         "map_left": map_left,
         "map_right": map_right,
         "baseline_m": baseline_m,
+        "alpha": alpha,
     }
 
 

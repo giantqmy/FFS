@@ -44,6 +44,11 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--gpu", type=int, default=0)
     parser.add_argument("--valid-iters", type=int, default=8)
     parser.add_argument("--max-disp", type=int, default=192)
+    parser.add_argument(
+        "--alpha",
+        type=float,
+        help="Rectification alpha override (default: checkpoint training value, then calibration JSON)",
+    )
     parser.add_argument("--min-disp-vis", type=float, default=None)
     parser.add_argument("--max-disp-vis", type=float, default=None)
     return parser.parse_args()
@@ -62,16 +67,27 @@ def main() -> None:
     device = torch.device(f"cuda:{args.gpu}")
     args.output_dir.mkdir(parents=True, exist_ok=True)
 
-    calibration = load_calibration(args.calibration_file)
+    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
+    if "model" not in checkpoint:
+        raise KeyError(f"Checkpoint has no 'model' state dict: {args.checkpoint}")
+    checkpoint_alpha = checkpoint.get("run_config", {}).get("rectification_alpha")
+    rectification_alpha = args.alpha if args.alpha is not None else checkpoint_alpha
+    calibration = load_calibration(
+        args.calibration_file, alpha_override=rectification_alpha
+    )
+    logging.info(
+        "Rectification alpha: %.6g (source: %s)",
+        calibration["alpha"],
+        "command line" if args.alpha is not None else (
+            "checkpoint" if checkpoint_alpha is not None else "calibration JSON"
+        ),
+    )
     left_raw = imageio.imread(args.left_file)
     right_raw = imageio.imread(args.right_file)
     left, right, rectification_valid = rectify_pair(left_raw, right_raw, calibration)
     imageio.imwrite(args.output_dir / "left_rectified.png", left)
     imageio.imwrite(args.output_dir / "right_rectified.png", right)
 
-    checkpoint = torch.load(args.checkpoint, map_location="cpu", weights_only=False)
-    if "model" not in checkpoint:
-        raise KeyError(f"Checkpoint has no 'model' state dict: {args.checkpoint}")
     model = torch.load(args.base_model, map_location="cpu", weights_only=False)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.args.valid_iters = args.valid_iters
