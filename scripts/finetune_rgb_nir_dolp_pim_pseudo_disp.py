@@ -193,7 +193,7 @@ def save_manifest(
             stream.write(f"{key}\t" + "\t".join(str(path.resolve()) for path in paths) + "\n")
 
 
-def main() -> None:
+def main(*, train_pim_only: bool = False) -> None:
     args = parse_args()
     seed_everything(args.seed)
     metadata = read_pseudo_metadata(args.pseudo_root)
@@ -254,7 +254,8 @@ def main() -> None:
     if args.check_data_only:
         return
     if not torch.cuda.is_available():
-        raise RuntimeError("FFS PIM full fine-tuning requires a CUDA GPU")
+        mode = "PIM-only fine-tuning" if train_pim_only else "full fine-tuning"
+        raise RuntimeError(f"FFS PIM {mode} requires a CUDA GPU")
     if args.gpu < 0 or args.gpu >= torch.cuda.device_count():
         raise ValueError(f"Invalid GPU {args.gpu}; CUDA device count={torch.cuda.device_count()}")
 
@@ -264,12 +265,22 @@ def main() -> None:
     model = FastFoundationStereoPIM(base_model)
     model.args.valid_iters = args.valid_iters
     model.args.max_disp = int(args.max_disp)
-    model.to(device).train()
-    # Full fine-tuning: base FFS, both copied DoLP encoders, and both PIMs.
+    model.to(device)
     for parameter in model.parameters():
-        parameter.requires_grad_(True)
+        parameter.requires_grad_(not train_pim_only)
+    adapter = model.base_model.feature
+    if train_pim_only:
+        # Keep every encoder and the complete stereo/GRU backbone frozen. The
+        # two fusion modules include the wavelet PIM and their 1x1 projections.
+        adapter.fusion_left.requires_grad_(True)
+        adapter.fusion_right.requires_grad_(True)
+        trainable_parameters = [
+            parameter for parameter in model.parameters() if parameter.requires_grad
+        ]
+    else:
+        trainable_parameters = list(model.parameters())
     optimizer = torch.optim.AdamW(
-        model.parameters(), lr=args.lr, weight_decay=args.weight_decay
+        trainable_parameters, lr=args.lr, weight_decay=args.weight_decay
     )
     scaler = torch.amp.GradScaler("cuda", enabled=bool(model.args.mixed_precision))
 
@@ -311,7 +322,7 @@ def main() -> None:
         "fusion_source": "GatedRCCBStereo/networks/pim_fusion.py",
         "fusion": "left RGB+RGB-DoLP; right NIR+NIR-DoLP",
         "dolp_input": "both DoLP PNGs are single-channel uint8; repeated to 3 channels only for the pretrained FFS encoder stem",
-        "fine_tuning": "full model",
+        "fine_tuning": "PIM fusion modules only" if train_pim_only else "full model",
         "trainable_parameters": trainable,
         "total_parameters": total,
         "rectification_alpha": alpha,
@@ -325,12 +336,21 @@ def main() -> None:
     )
     with (args.output / "cfg.yaml").open("w", encoding="utf-8") as stream:
         yaml.safe_dump(to_yamlable(dict(model.args)), stream, sort_keys=False)
-    print(f"Full fine-tuning parameters: {trainable:,}/{total:,}", flush=True)
+    mode_label = "PIM-only" if train_pim_only else "Full fine-tuning"
+    print(f"{mode_label} parameters: {trainable:,}/{total:,}", flush=True)
 
     for epoch in range(start_epoch, args.epochs):
         epoch_result = {"epoch": epoch + 1}
         for phase, loader in (("train", train_loader), ("val", val_loader)):
-            model.train(phase == "train")
+            if phase == "train" and train_pim_only:
+                # model.train() would also update running statistics in the
+                # frozen encoders. Only the two trainable PIM fusions enter
+                # training mode; the complete frozen backbone stays in eval.
+                model.eval()
+                adapter.fusion_left.train()
+                adapter.fusion_right.train()
+            else:
+                model.train(phase == "train")
             loss_sum = 0.0
             batches = 0
             disparity_totals = {"count": 0, "abs_sum": 0.0, "bad1": 0, "bad3": 0}
@@ -365,7 +385,7 @@ def main() -> None:
                     if phase == "train":
                         scaler.scale(loss).backward()
                         scaler.unscale_(optimizer)
-                        torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
+                        torch.nn.utils.clip_grad_norm_(trainable_parameters, 1.0)
                         scaler.step(optimizer)
                         scaler.update()
                         metrics = disparity_metrics(predictions[-1], gt_disp, valid)
