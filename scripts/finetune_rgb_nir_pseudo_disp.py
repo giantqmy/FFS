@@ -44,6 +44,14 @@ def parse_args() -> argparse.Namespace:
         required=True,
         help="Directory containing disparity_left_npy, valid_mask, and metadata.json",
     )
+    parser.add_argument(
+        "--sparse-gt-dir",
+        type=Path,
+        default=Path("/media/ddc/新加卷/hys/qmy/depth/bevneed/raw_left_sparse_depth_u16"),
+        help="Raw distorted left-camera LiDAR depth, uint16 metres*256",
+    )
+    parser.add_argument("--eval-min-depth", type=float, default=0.1)
+    parser.add_argument("--eval-max-depth", type=float, default=200.0)
     parser.add_argument("--calibration-file", type=Path, default=DEFAULT_CALIBRATION)
     parser.add_argument(
         "--alpha",
@@ -75,6 +83,8 @@ def parse_args() -> argparse.Namespace:
         parser.error("--feature-lr must be positive")
     if args.max_disp <= 0.0:
         parser.error("--max-disp must be positive")
+    if args.eval_min_depth <= 0.0 or args.eval_max_depth <= args.eval_min_depth:
+        parser.error("Require 0 < --eval-min-depth < --eval-max-depth")
     if not 0.0 < args.gamma <= 1.0:
         parser.error("--gamma must be in (0, 1]")
     if not 0.0 < args.val_fraction < 1.0:
@@ -119,6 +129,8 @@ def load_calibration(path: Path, alpha: float) -> dict:
     )
     return {
         "size": (width, height),
+        "K_left": k_left,
+        "dist_left": d_left,
         "map_left": map_left,
         "map_right": map_right,
         "P1": p1,
@@ -158,25 +170,86 @@ def index_files(directory: Path, suffix: str) -> dict[str, Path]:
     return {path.name[: -len(suffix)]: path for path in directory.glob(f"*{suffix}")}
 
 
+def rectify_sparse_left_depth(raw_depth_m: np.ndarray, calibration: dict) -> np.ndarray:
+    """Forward-project raw distorted camera-Z samples onto the rectified grid."""
+    expected_w, expected_h = calibration["size"]
+    if raw_depth_m.shape != (expected_h, expected_w):
+        raise ValueError(
+            f"Raw sparse depth must be {expected_w}x{expected_h}, got {raw_depth_m.shape}"
+        )
+    valid = np.isfinite(raw_depth_m) & (raw_depth_m > 0.0)
+    vv, uu = np.nonzero(valid)
+    rectified = np.zeros((expected_h, expected_w), dtype=np.float32)
+    if uu.size == 0:
+        return rectified
+
+    pixels = np.stack((uu, vv), axis=-1).astype(np.float64).reshape(-1, 1, 2)
+    normalized = cv2.undistortPoints(
+        pixels,
+        calibration["K_left"],
+        calibration["dist_left"],
+    ).reshape(-1, 2)
+    z_raw = raw_depth_m[vv, uu].astype(np.float64)
+    points_raw = np.column_stack(
+        (normalized[:, 0] * z_raw, normalized[:, 1] * z_raw, z_raw)
+    )
+    points_rectified = points_raw @ calibration["R1"].T
+    z_rectified = points_rectified[:, 2]
+    projected = points_rectified @ calibration["P1"][:, :3].T
+    finite = (
+        np.isfinite(projected).all(axis=1)
+        & np.isfinite(z_rectified)
+        & (z_rectified > 0.0)
+    )
+    projected = projected[finite]
+    z_rectified = z_rectified[finite]
+    u_rect = np.rint(projected[:, 0] / projected[:, 2]).astype(np.int64)
+    v_rect = np.rint(projected[:, 1] / projected[:, 2]).astype(np.int64)
+    inside = (
+        (u_rect >= 0) & (u_rect < expected_w)
+        & (v_rect >= 0) & (v_rect < expected_h)
+    )
+    u_rect, v_rect, z_rectified = (
+        u_rect[inside], v_rect[inside], z_rectified[inside]
+    )
+
+    # Keep the nearest LiDAR return if multiple samples round to one pixel.
+    flat = np.full(expected_h * expected_w, np.inf, dtype=np.float32)
+    np.minimum.at(
+        flat,
+        v_rect * expected_w + u_rect,
+        z_rectified.astype(np.float32),
+    )
+    flat[~np.isfinite(flat)] = 0.0
+    return flat.reshape(expected_h, expected_w)
+
+
 class RGBNIRPseudoDisparityDataset(Dataset):
     def __init__(
         self,
         rgb_dir: Path,
         nir_dir: Path,
         pseudo_root: Path,
+        sparse_gt_dir: Path,
         calibration: dict,
         max_disp: float,
     ) -> None:
         self.calibration = calibration
         self.max_disp = float(max_disp)
+        self.sparse_eval_indices: set[int] = set()
         rgb = index_files(rgb_dir, "_S0_rgb.png")
         nir = index_files(nir_dir, "_S0_nir.png")
         disparities = index_files(pseudo_root / "disparity_left_npy", "_disp_left_px.npy")
         masks = index_files(pseudo_root / "valid_mask", "_valid_mask.png")
-        keys = sorted(set(rgb) & set(nir) & set(disparities) & set(masks))
+        sparse_gt = index_files(sparse_gt_dir, "_depth_gt_sparse_u16.png")
+        keys = sorted(set(rgb) & set(nir) & set(disparities) & set(masks) & set(sparse_gt))
         if not keys:
-            raise RuntimeError("No matching RGB/NIR/pseudo-disparity/mask timestamp keys")
-        self.samples = [(rgb[k], nir[k], disparities[k], masks[k], k) for k in keys]
+            raise RuntimeError(
+                "No matching RGB/NIR/pseudo-disparity/mask/sparse-GT timestamp keys"
+            )
+        self.samples = [
+            (rgb[k], nir[k], disparities[k], masks[k], sparse_gt[k], k) for k in keys
+        ]
         print(
             "Dataset counts:",
             {
@@ -184,6 +257,7 @@ class RGBNIRPseudoDisparityDataset(Dataset):
                 "NIR": len(nir),
                 "disparity": len(disparities),
                 "mask": len(masks),
+                "sparse_gt": len(sparse_gt),
                 "matched": len(keys),
             },
             flush=True,
@@ -192,8 +266,11 @@ class RGBNIRPseudoDisparityDataset(Dataset):
     def __len__(self) -> int:
         return len(self.samples)
 
+    def set_sparse_eval_indices(self, indices: list[int]) -> None:
+        self.sparse_eval_indices = set(indices)
+
     def __getitem__(self, index: int) -> dict:
-        rgb_path, nir_path, disparity_path, mask_path, key = self.samples[index]
+        rgb_path, nir_path, disparity_path, mask_path, sparse_gt_path, key = self.samples[index]
         rgb = imageio.imread(rgb_path)
         nir = imageio.imread(nir_path)
         disparity = np.load(disparity_path, allow_pickle=False)
@@ -233,23 +310,43 @@ class RGBNIRPseudoDisparityDataset(Dataset):
             & ((xx - disparity) >= 0.0)
         )
         disparity = np.where(valid, disparity, 0.0).astype(np.float32)
+        sparse_gt_m = np.zeros((expected_h, expected_w), dtype=np.float32)
+        if index in self.sparse_eval_indices:
+            sparse_gt_u16 = cv2.imread(str(sparse_gt_path), cv2.IMREAD_UNCHANGED)
+            if (
+                sparse_gt_u16 is None
+                or sparse_gt_u16.dtype != np.uint16
+                or sparse_gt_u16.shape != (expected_h, expected_w)
+            ):
+                got = None if sparse_gt_u16 is None else (
+                    sparse_gt_u16.dtype, sparse_gt_u16.shape
+                )
+                raise ValueError(
+                    f"Sparse GT must be uint16 {expected_w}x{expected_h}: "
+                    f"{sparse_gt_path}; got {got}"
+                )
+            sparse_gt_m = rectify_sparse_left_depth(
+                sparse_gt_u16.astype(np.float32) / 256.0,
+                self.calibration,
+            )
         return {
             "left": torch.from_numpy(rgb.transpose(2, 0, 1).copy()).float(),
             "right": torch.from_numpy(nir.transpose(2, 0, 1).copy()).float(),
             "disp": torch.from_numpy(disparity[None].copy()).float(),
             "valid": torch.from_numpy(valid[None].copy()),
+            "sparse_gt_depth": torch.from_numpy(sparse_gt_m[None].copy()).float(),
             "key": key,
         }
 
 
 def save_manifest(path: Path, dataset: RGBNIRPseudoDisparityDataset, indices: list[int]) -> None:
     with path.open("w", encoding="utf-8", newline="\n") as stream:
-        stream.write("# key\trgb\tnir\tdisparity\tmask\n")
+        stream.write("# key\trgb\tnir\tdisparity\tmask\tsparse_gt_depth\n")
         for index in indices:
-            rgb, nir, disparity, mask, key = dataset.samples[index]
+            rgb, nir, disparity, mask, sparse_gt, key = dataset.samples[index]
             stream.write(
                 f"{key}\t{rgb.resolve()}\t{nir.resolve()}\t"
-                f"{disparity.resolve()}\t{mask.resolve()}\n"
+                f"{disparity.resolve()}\t{mask.resolve()}\t{sparse_gt.resolve()}\n"
             )
 
 
@@ -268,6 +365,42 @@ def disparity_metrics(prediction: torch.Tensor, target: torch.Tensor, valid: tor
     }
 
 
+@torch.no_grad()
+def sparse_depth_metrics(
+    prediction_disp: torch.Tensor,
+    sparse_gt_depth: torch.Tensor,
+    focal_baseline: float,
+    min_depth: float,
+    max_depth: float,
+) -> dict:
+    gt_valid = (
+        torch.isfinite(sparse_gt_depth)
+        & (sparse_gt_depth >= min_depth)
+        & (sparse_gt_depth <= max_depth)
+        & torch.isfinite(prediction_disp)
+    )
+    count = int(gt_valid.sum())
+    if count == 0:
+        return {
+            "count": 0, "abs_sum": 0.0, "sq_sum": 0.0,
+            "delta1": 0, "delta2": 0, "delta3": 0,
+        }
+    # Keep every real-GT pixel in the metric. Non-positive predictions become
+    # a very large depth error instead of silently disappearing from evaluation.
+    pred_depth = focal_baseline / prediction_disp[gt_valid].float().clamp(min=1e-6)
+    gt_depth = sparse_gt_depth[gt_valid].float()
+    error = pred_depth - gt_depth
+    ratio = torch.maximum(pred_depth / gt_depth, gt_depth / pred_depth.clamp(min=1e-6))
+    return {
+        "count": count,
+        "abs_sum": float(error.abs().double().sum()),
+        "sq_sum": float(error.double().square().sum()),
+        "delta1": int((ratio <= 1.25).sum()),
+        "delta2": int((ratio <= 1.25 ** 2).sum()),
+        "delta3": int((ratio <= 1.25 ** 3).sum()),
+    }
+
+
 def main() -> None:
     args = parse_args()
     seed_everything(args.seed)
@@ -282,7 +415,8 @@ def main() -> None:
     calibration = load_calibration(args.calibration_file, alpha)
     verify_pseudo_geometry(metadata, calibration)
     dataset = RGBNIRPseudoDisparityDataset(
-        args.rgb_dir, args.nir_dir, args.pseudo_root, calibration, args.max_disp
+        args.rgb_dir, args.nir_dir, args.pseudo_root, args.sparse_gt_dir,
+        calibration, args.max_disp
     )
 
     indices = list(range(len(dataset)))
@@ -293,6 +427,7 @@ def main() -> None:
         raise RuntimeError("At least two matched samples are required")
     val_count = min(len(indices) - 1, max(1, int(len(indices) * args.val_fraction)))
     val_indices, train_indices = indices[:val_count], indices[val_count:]
+    dataset.set_sparse_eval_indices(val_indices)
     args.output.mkdir(parents=True, exist_ok=True)
     save_manifest(args.output / "train.txt", dataset, train_indices)
     save_manifest(args.output / "val.txt", dataset, val_indices)
@@ -302,11 +437,24 @@ def main() -> None:
     if valid_count == 0:
         raise RuntimeError(f"First training sample has no valid labels: {sample['key']}")
     valid_disp = sample["disp"][sample["valid"]]
+    val_sample = dataset[val_indices[0]]
+    sparse_gt_count = int(
+        (
+            (val_sample["sparse_gt_depth"] >= args.eval_min_depth)
+            & (val_sample["sparse_gt_depth"] <= args.eval_max_depth)
+        ).sum()
+    )
+    if sparse_gt_count == 0:
+        raise RuntimeError(
+            f"First validation sample has no valid sparse GT after rectification: "
+            f"{val_sample['key']}"
+        )
     print(
         f"seed={args.seed}, train={len(train_indices)}, val={len(val_indices)}, "
         f"left={tuple(sample['left'].shape)}, right={tuple(sample['right'].shape)}, "
         f"valid_pixels={valid_count}, disparity_range_px="
         f"({valid_disp.min().item():.4f}, {valid_disp.max().item():.4f}), "
+        f"first_val_sparse_gt_pixels={sparse_gt_count}, "
         f"alpha={alpha}, fx={calibration['fx']:.6f}, "
         f"baseline_m={calibration['baseline']:.9f}",
         flush=True,
@@ -362,7 +510,9 @@ def main() -> None:
         optimizer.load_state_dict(checkpoint["optimizer"])
         scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = int(checkpoint["epoch"])
-        best_val = float(checkpoint.get("best_val", best_val))
+        # Older checkpoints used pseudo-label val_loss for best_val. Do not
+        # compare that quantity with the new sparse-LiDAR depth MAE.
+        best_val = float(checkpoint.get("best_val_depth_mae_m", best_val))
         history = list(checkpoint.get("history", []))
 
     train_loader = DataLoader(
@@ -384,6 +534,7 @@ def main() -> None:
         "rgb_dir": str(args.rgb_dir),
         "nir_dir": str(args.nir_dir),
         "pseudo_root": str(args.pseudo_root),
+        "sparse_gt_dir": str(args.sparse_gt_dir),
         "calibration_file": str(args.calibration_file),
         "model": str(args.model),
         "resume": None if args.resume is None else str(args.resume),
@@ -393,6 +544,11 @@ def main() -> None:
         "baseline_m": calibration["baseline"],
         "loss": "unchanged: initial SmoothL1 plus gamma-weighted iterative L1",
         "label": "rectified left pseudo disparity filtered by LR-consistency mask",
+        "validation_metrics": (
+            "predicted depth from final disparity compared with rectified raw LiDAR "
+            "depth: MAE, RMSE, delta1, delta2, delta3"
+        ),
+        "best_model_selection": "minimum validation sparse-LiDAR depth MAE",
     }
     (args.output / "run_config.json").write_text(
         json.dumps(to_yamlable(run_config), indent=2, ensure_ascii=False), encoding="utf-8"
@@ -406,7 +562,15 @@ def main() -> None:
             model.train(phase == "train")
             loss_sum = 0.0
             batches = 0
-            totals = {"count": 0, "abs_sum": 0.0, "bad1": 0, "bad3": 0}
+            disparity_totals = {"count": 0, "abs_sum": 0.0, "bad1": 0, "bad3": 0}
+            depth_totals = {
+                "count": 0,
+                "abs_sum": 0.0,
+                "sq_sum": 0.0,
+                "delta1": 0,
+                "delta2": 0,
+                "delta3": 0,
+            }
             context = torch.enable_grad() if phase == "train" else torch.no_grad()
             with context:
                 for step, batch in enumerate(loader, start=1):
@@ -414,6 +578,9 @@ def main() -> None:
                     right = batch["right"].to(device, non_blocking=True)
                     gt_disp = batch["disp"].to(device, non_blocking=True)
                     valid = batch["valid"].to(device, non_blocking=True).bool()
+                    sparse_gt_depth = batch["sparse_gt_depth"].to(
+                        device, non_blocking=True
+                    )
                     if phase == "train":
                         optimizer.zero_grad(set_to_none=True)
                     init_disp, predictions = model(
@@ -437,9 +604,20 @@ def main() -> None:
                         scaler.step(optimizer)
                         scaler.update()
 
-                    metrics = disparity_metrics(predictions[-1], gt_disp, valid)
-                    for name in totals:
-                        totals[name] += metrics[name]
+                    if phase == "train":
+                        metrics = disparity_metrics(predictions[-1], gt_disp, valid)
+                        for name in disparity_totals:
+                            disparity_totals[name] += metrics[name]
+                    else:
+                        metrics = sparse_depth_metrics(
+                            predictions[-1],
+                            sparse_gt_depth,
+                            calibration["fx"] * calibration["baseline"],
+                            args.eval_min_depth,
+                            args.eval_max_depth,
+                        )
+                        for name in depth_totals:
+                            depth_totals[name] += metrics[name]
                     loss_sum += float(loss.detach())
                     batches += 1
                     if step == 1 or step == len(loader) or step % 20 == 0:
@@ -451,21 +629,44 @@ def main() -> None:
                             flush=True,
                         )
 
-            count = totals["count"]
             epoch_result[f"{phase}_loss"] = loss_sum / max(batches, 1)
-            epoch_result[f"{phase}_disp_mae_px"] = totals["abs_sum"] / count if count else None
-            epoch_result[f"{phase}_bad1"] = totals["bad1"] / count if count else None
-            epoch_result[f"{phase}_bad3"] = totals["bad3"] / count if count else None
-            epoch_result[f"{phase}_valid_pixels"] = count
+            if phase == "train":
+                count = disparity_totals["count"]
+                epoch_result["train_disp_mae_px"] = (
+                    disparity_totals["abs_sum"] / count if count else None
+                )
+                epoch_result["train_valid_pixels"] = count
+            else:
+                count = depth_totals["count"]
+                epoch_result["val_depth_mae_m"] = (
+                    depth_totals["abs_sum"] / count if count else None
+                )
+                epoch_result["val_depth_rmse_m"] = (
+                    (depth_totals["sq_sum"] / count) ** 0.5 if count else None
+                )
+                epoch_result["val_delta1"] = (
+                    depth_totals["delta1"] / count if count else None
+                )
+                epoch_result["val_delta2"] = (
+                    depth_totals["delta2"] / count if count else None
+                )
+                epoch_result["val_delta3"] = (
+                    depth_totals["delta3"] / count if count else None
+                )
+                epoch_result["val_sparse_gt_pixels"] = count
 
         history.append(epoch_result)
-        if epoch_result["val_loss"] < best_val:
-            best_val = epoch_result["val_loss"]
+        selection_metric = epoch_result["val_depth_mae_m"]
+        if selection_metric is None:
+            raise RuntimeError("Validation produced no valid sparse-LiDAR depth pixels")
+        if selection_metric < best_val:
+            best_val = selection_metric
             torch.save(
                 {
                     "model": model.state_dict(),
                     "epoch": epoch + 1,
-                    "val_loss": best_val,
+                    "val_loss": epoch_result["val_loss"],
+                    "val_depth_mae_m": selection_metric,
                     "run_config": run_config,
                 },
                 args.output / "best_model.pt",
@@ -478,6 +679,7 @@ def main() -> None:
                 "scaler": scaler.state_dict(),
                 "epoch": epoch + 1,
                 "best_val": best_val,
+                "best_val_depth_mae_m": best_val,
                 "history": history,
                 "run_config": run_config,
             },

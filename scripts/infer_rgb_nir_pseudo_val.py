@@ -60,11 +60,12 @@ def read_manifest(path: Path) -> list[dict[str, Path | str]]:
             if not line or line.startswith("#"):
                 continue
             fields = line.split("\t")
-            if len(fields) != 5:
+            if len(fields) not in (5, 6):
                 raise ValueError(
-                    f"Expected 5 tab-separated fields in {path}:{line_number}, got {len(fields)}"
+                    f"Expected 5 or 6 tab-separated fields in {path}:{line_number}, "
+                    f"got {len(fields)}"
                 )
-            key, rgb, nir, disparity, mask = fields
+            key, rgb, nir, disparity, mask = fields[:5]
             samples.append(
                 {
                     "key": key,
