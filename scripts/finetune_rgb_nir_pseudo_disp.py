@@ -377,17 +377,27 @@ def sparse_depth_metrics(
         torch.isfinite(sparse_gt_depth)
         & (sparse_gt_depth >= min_depth)
         & (sparse_gt_depth <= max_depth)
-        & torch.isfinite(prediction_disp)
     )
     count = int(gt_valid.sum())
     if count == 0:
         return {
             "count": 0, "abs_sum": 0.0, "sq_sum": 0.0,
             "delta1": 0, "delta2": 0, "delta3": 0,
+            "invalid_disp": 0, "clipped_disp": 0,
         }
-    # Keep every real-GT pixel in the metric. Non-positive predictions become
-    # a very large depth error instead of silently disappearing from evaluation.
-    pred_depth = focal_baseline / prediction_disp[gt_valid].float().clamp(min=1e-6)
+    # Keep every real-GT pixel, but evaluate predictions only inside the same
+    # metric-depth range. Invalid/non-positive disparities receive the maximum
+    # depth penalty instead of exploding to tens of millions of metres.
+    raw_disp = prediction_disp[gt_valid].float()
+    min_disp = float(focal_baseline) / float(max_depth)
+    max_disp = float(focal_baseline) / float(min_depth)
+    finite = torch.isfinite(raw_disp)
+    invalid_disp = (~finite) | (raw_disp <= 0.0)
+    clipped_disp = (~finite) | (raw_disp < min_disp) | (raw_disp > max_disp)
+    pred_disp = torch.nan_to_num(
+        raw_disp, nan=min_disp, posinf=min_disp, neginf=min_disp
+    ).clamp(min=min_disp, max=max_disp)
+    pred_depth = float(focal_baseline) / pred_disp
     gt_depth = sparse_gt_depth[gt_valid].float()
     error = pred_depth - gt_depth
     ratio = torch.maximum(pred_depth / gt_depth, gt_depth / pred_depth.clamp(min=1e-6))
@@ -398,6 +408,8 @@ def sparse_depth_metrics(
         "delta1": int((ratio <= 1.25).sum()),
         "delta2": int((ratio <= 1.25 ** 2).sum()),
         "delta3": int((ratio <= 1.25 ** 3).sum()),
+        "invalid_disp": int(invalid_disp.sum()),
+        "clipped_disp": int(clipped_disp.sum()),
     }
 
 
@@ -570,6 +582,8 @@ def main() -> None:
                 "delta1": 0,
                 "delta2": 0,
                 "delta3": 0,
+                "invalid_disp": 0,
+                "clipped_disp": 0,
             }
             context = torch.enable_grad() if phase == "train" else torch.no_grad()
             with context:
@@ -654,6 +668,14 @@ def main() -> None:
                     depth_totals["delta3"] / count if count else None
                 )
                 epoch_result["val_sparse_gt_pixels"] = count
+                epoch_result["val_invalid_disp_pixels"] = depth_totals["invalid_disp"]
+                epoch_result["val_invalid_disp_rate"] = (
+                    depth_totals["invalid_disp"] / count if count else None
+                )
+                epoch_result["val_clipped_disp_pixels"] = depth_totals["clipped_disp"]
+                epoch_result["val_clipped_disp_rate"] = (
+                    depth_totals["clipped_disp"] / count if count else None
+                )
 
         history.append(epoch_result)
         selection_metric = epoch_result["val_depth_mae_m"]

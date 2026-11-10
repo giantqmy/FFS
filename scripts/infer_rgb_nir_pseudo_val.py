@@ -19,6 +19,7 @@ ROOT = SCRIPT_DIR.parent
 sys.path.insert(0, str(ROOT))
 
 from core.utils.utils import InputPadder  # noqa: E402
+from core.pim_ffs import FastFoundationStereoPIM  # noqa: E402
 from Utils import AMP_DTYPE  # noqa: E402
 from run_demo_rectified import load_calibration, rectify_pair, scaled_rectified_intrinsics  # noqa: E402
 
@@ -60,25 +61,40 @@ def read_manifest(path: Path) -> list[dict[str, Path | str]]:
             if not line or line.startswith("#"):
                 continue
             fields = line.split("\t")
-            if len(fields) not in (5, 6):
+            if len(fields) not in (5, 6, 8):
                 raise ValueError(
-                    f"Expected 5 or 6 tab-separated fields in {path}:{line_number}, "
+                    f"Expected 5, 6, or 8 tab-separated fields in "
+                    f"{path}:{line_number}, "
                     f"got {len(fields)}"
                 )
-            key, rgb, nir, disparity, mask = fields[:5]
-            samples.append(
-                {
+            if len(fields) == 8:
+                key, rgb, nir, rgb_dolp, nir_dolp, disparity, mask, _ = fields
+                sample = {
+                    "key": key,
+                    "rgb": Path(rgb),
+                    "nir": Path(nir),
+                    "rgb_dolp": Path(rgb_dolp),
+                    "nir_dolp": Path(nir_dolp),
+                    "disparity": Path(disparity),
+                    "mask": Path(mask),
+                }
+            else:
+                key, rgb, nir, disparity, mask = fields[:5]
+                sample = {
                     "key": key,
                     "rgb": Path(rgb),
                     "nir": Path(nir),
                     "disparity": Path(disparity),
                     "mask": Path(mask),
                 }
-            )
+            samples.append(sample)
     if not samples:
         raise RuntimeError(f"No validation samples in {path}")
     for sample in samples:
-        for name in ("rgb", "nir", "disparity", "mask"):
+        required = ["rgb", "nir", "disparity", "mask"]
+        if "rgb_dolp" in sample:
+            required.extend(("rgb_dolp", "nir_dolp"))
+        for name in required:
             path_value = sample[name]
             if not path_value.is_file():
                 raise FileNotFoundError(f"Missing {name} for {sample['key']}: {path_value}")
@@ -95,29 +111,65 @@ def load_model_and_settings(args: argparse.Namespace, device: torch.device):
     checkpoint_alpha = run_config.get("rectification_alpha")
     alpha = args.alpha if args.alpha is not None else checkpoint_alpha
 
+    state_dict = checkpoint["model"]
+    is_pim = any(name.startswith("base_model.feature.fusion_") for name in state_dict)
     model = torch.load(args.base_model, map_location="cpu", weights_only=False)
+    if is_pim:
+        model = FastFoundationStereoPIM(model)
     model.load_state_dict(checkpoint["model"], strict=True)
     model.args.valid_iters = valid_iters
     model.args.max_disp = max_disp
     model.to(device).eval()
-    return model, valid_iters, max_disp, alpha
+    return model, valid_iters, max_disp, alpha, is_pim
 
 
-def infer_pair(model, left_raw, right_raw, calibration, device, valid_iters):
+def rectify_dolp(image, calibration, side):
+    expected_width, expected_height = calibration["size"]
+    if image is None or image.shape != (expected_height, expected_width):
+        shape = None if image is None else image.shape
+        raise ValueError(
+            f"{side} DoLP must be grayscale {expected_width}x{expected_height}; got {shape}"
+        )
+    map_x, map_y = calibration[f"map_{side}"]
+    rectified = cv2.remap(
+        image, map_x, map_y, cv2.INTER_LINEAR,
+        borderMode=cv2.BORDER_CONSTANT, borderValue=0,
+    )
+    return np.repeat(rectified[..., None], 3, axis=2)
+
+
+def infer_pair(
+    model, left_raw, right_raw, calibration, device, valid_iters,
+    left_dolp_raw=None, right_dolp_raw=None,
+):
     left, right, rectification_valid = rectify_pair(left_raw, right_raw, calibration)
     height, width = left.shape[:2]
     image0 = torch.as_tensor(left, device=device).float()[None].permute(0, 3, 1, 2)
     image1 = torch.as_tensor(right, device=device).float()[None].permute(0, 3, 1, 2)
     padder = InputPadder(image0.shape, divis_by=32, force_square=False)
-    image0, image1 = padder.pad(image0, image1)
+    is_pim = left_dolp_raw is not None or right_dolp_raw is not None
+    if is_pim:
+        if left_dolp_raw is None or right_dolp_raw is None:
+            raise ValueError("PIM inference requires both left and right DoLP images")
+        left_dolp = rectify_dolp(left_dolp_raw, calibration, "left")
+        right_dolp = rectify_dolp(right_dolp_raw, calibration, "right")
+        dolp0 = torch.as_tensor(left_dolp, device=device).float()[None].permute(0, 3, 1, 2)
+        dolp1 = torch.as_tensor(right_dolp, device=device).float()[None].permute(0, 3, 1, 2)
+        image0, image1, dolp0, dolp1 = padder.pad(image0, image1, dolp0, dolp1)
+    else:
+        image0, image1 = padder.pad(image0, image1)
     with torch.inference_mode(), torch.amp.autocast("cuda", enabled=True, dtype=AMP_DTYPE):
-        prediction = model(
-            image0,
-            image1,
-            iters=valid_iters,
-            test_mode=True,
-            optimize_build_volume="pytorch1",
-        )
+        if is_pim:
+            prediction = model(
+                image0, image1, dolp0, dolp1,
+                iters=valid_iters, test_mode=True,
+                optimize_build_volume="pytorch1",
+            )
+        else:
+            prediction = model(
+                image0, image1, iters=valid_iters, test_mode=True,
+                optimize_build_volume="pytorch1",
+            )
     disparity = padder.unpad(prediction.float()).cpu().numpy().reshape(height, width)
     disparity = np.clip(disparity, 0.0, None).astype(np.float32)
     _, xx = np.indices(disparity.shape)
@@ -232,7 +284,13 @@ def main() -> None:
 
     torch.cuda.set_device(args.gpu)
     device = torch.device(f"cuda:{args.gpu}")
-    model, valid_iters, max_disp, alpha = load_model_and_settings(args, device)
+    model, valid_iters, max_disp, alpha, is_pim = load_model_and_settings(args, device)
+    manifest_is_pim = "rgb_dolp" in samples[0]
+    if manifest_is_pim != is_pim:
+        raise ValueError(
+            f"Checkpoint model type is {'PIM' if is_pim else 'intensity-only'}, but "
+            f"manifest type is {'PIM (8 fields)' if manifest_is_pim else 'intensity-only'}"
+        )
     calibration = load_calibration(args.calibration_file, alpha_override=alpha)
     args.output_dir.mkdir(parents=True, exist_ok=True)
     dirs = {
@@ -243,8 +301,9 @@ def main() -> None:
         directory.mkdir(parents=True, exist_ok=True)
 
     logging.info(
-        "Validation samples=%d, valid_iters=%d, max_disp=%d, alpha=%.6g",
-        len(samples), valid_iters, max_disp, calibration["alpha"],
+        "Validation samples=%d, model=%s, valid_iters=%d, max_disp=%d, alpha=%.6g",
+        len(samples), "PIM" if is_pim else "intensity-only",
+        valid_iters, max_disp, calibration["alpha"],
     )
     totals = {"valid_pixels": 0, "abs_error_sum": 0.0, "bad1_count": 0, "bad3_count": 0}
     records = []
@@ -253,6 +312,11 @@ def main() -> None:
         preview_path = dirs["preview"] / f"{key}_val_comparison.png"
         left_raw = imageio.imread(sample["rgb"])
         right_raw = imageio.imread(sample["nir"])
+        if is_pim:
+            left_dolp_raw = cv2.imread(str(sample["rgb_dolp"]), cv2.IMREAD_GRAYSCALE)
+            right_dolp_raw = cv2.imread(str(sample["nir_dolp"]), cv2.IMREAD_GRAYSCALE)
+        else:
+            left_dolp_raw = right_dolp_raw = None
         target = np.load(sample["disparity"], allow_pickle=False).astype(np.float32)
         target_mask_image = cv2.imread(str(sample["mask"]), cv2.IMREAD_UNCHANGED)
         if target_mask_image is None:
@@ -269,7 +333,8 @@ def main() -> None:
         )
 
         left, right, prediction, prediction_valid = infer_pair(
-            model, left_raw, right_raw, calibration, device, valid_iters
+            model, left_raw, right_raw, calibration, device, valid_iters,
+            left_dolp_raw, right_dolp_raw,
         )
         if prediction.shape != target.shape:
             raise ValueError(
@@ -321,6 +386,7 @@ def main() -> None:
         "rectification_alpha": calibration["alpha"],
         "valid_iters": valid_iters,
         "max_disp": max_disp,
+        "model_type": "PIM" if is_pim else "intensity-only",
         "requested_samples": len(samples),
         "processed_samples": len(records),
         "valid_pixels": count,

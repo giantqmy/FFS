@@ -357,6 +357,7 @@ def main(*, train_pim_only: bool = False) -> None:
             depth_totals = {
                 "count": 0, "abs_sum": 0.0, "sq_sum": 0.0,
                 "delta1": 0, "delta2": 0, "delta3": 0,
+                "invalid_disp": 0, "clipped_disp": 0,
             }
             context = torch.enable_grad() if phase == "train" else torch.no_grad()
             with context:
@@ -426,6 +427,14 @@ def main(*, train_pim_only: bool = False) -> None:
                 for delta in ("delta1", "delta2", "delta3"):
                     epoch_result[f"val_{delta}"] = depth_totals[delta] / count if count else None
                 epoch_result["val_sparse_gt_pixels"] = count
+                epoch_result["val_invalid_disp_pixels"] = depth_totals["invalid_disp"]
+                epoch_result["val_invalid_disp_rate"] = (
+                    depth_totals["invalid_disp"] / count if count else None
+                )
+                epoch_result["val_clipped_disp_pixels"] = depth_totals["clipped_disp"]
+                epoch_result["val_clipped_disp_rate"] = (
+                    depth_totals["clipped_disp"] / count if count else None
+                )
 
         selection_metric = epoch_result["val_depth_mae_m"]
         if selection_metric is None:
