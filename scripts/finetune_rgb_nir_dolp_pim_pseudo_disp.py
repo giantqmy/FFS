@@ -130,20 +130,26 @@ class RGBNIRDoLPPseudoDataset(RGBNIRPseudoDisparityDataset):
         sample = super().__getitem__(index)
         expected_w, expected_h = self.calibration["size"]
         rgb_path, nir_path = self.dolp_paths[index]
-        rgb_dolp = imageio.imread(rgb_path)
-        nir_dolp = imageio.imread(nir_path)
-        if rgb_dolp.dtype != np.uint8 or rgb_dolp.shape != (expected_h, expected_w, 3):
-            raise ValueError(
-                f"RGB DoLP must be uint8 {expected_w}x{expected_h}x3: "
-                f"{rgb_path}; got {rgb_dolp.dtype} {rgb_dolp.shape}"
-            )
-        if nir_dolp.ndim == 3 and nir_dolp.shape[2] == 1:
-            nir_dolp = nir_dolp[..., 0]
-        if nir_dolp.dtype != np.uint8 or nir_dolp.shape != (expected_h, expected_w):
-            raise ValueError(
-                f"NIR DoLP must be uint8 {expected_w}x{expected_h}: "
-                f"{nir_path}; got {nir_dolp.dtype} {nir_dolp.shape}"
-            )
+        # Both polarization inputs are intentionally decoded as one channel.
+        # RGB DoLP files may be stored as a three-channel color rendering; the
+        # model experiment requested here uses their grayscale DoLP signal.
+        rgb_dolp = cv2.imread(str(rgb_path), cv2.IMREAD_GRAYSCALE)
+        nir_dolp = cv2.imread(str(nir_path), cv2.IMREAD_GRAYSCALE)
+        for label, path, image in (
+            ("RGB DoLP", rgb_path, rgb_dolp),
+            ("NIR DoLP", nir_path, nir_dolp),
+        ):
+            if image is None:
+                raise ValueError(f"Cannot read {label}: {path}")
+            if image.dtype != np.uint8 or image.shape != (expected_h, expected_w):
+                raise ValueError(
+                    f"{label} must be single-channel uint8 {expected_w}x{expected_h}: "
+                    f"{path}; got {image.dtype} {image.shape}"
+                )
+            if label == "RGB DoLP":
+                rgb_dolp = image
+            else:
+                nir_dolp = image
         rgb_dolp = cv2.remap(
             rgb_dolp, *self.calibration["map_left"], cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT, borderValue=0,
@@ -152,6 +158,9 @@ class RGBNIRDoLPPseudoDataset(RGBNIRPseudoDisparityDataset):
             nir_dolp, *self.calibration["map_right"], cv2.INTER_LINEAR,
             borderMode=cv2.BORDER_CONSTANT, borderValue=0,
         )
+        # The pretrained FFS EdgeNeXt stem is three-channel. Replication adapts
+        # single-channel DoLP without introducing color information.
+        rgb_dolp = np.repeat(rgb_dolp[..., None], 3, axis=2)
         nir_dolp = np.repeat(nir_dolp[..., None], 3, axis=2)
         sample["left_dolp"] = torch.from_numpy(
             rgb_dolp.transpose(2, 0, 1).copy()
@@ -290,9 +299,10 @@ def main() -> None:
         "model": str(args.model),
         "resume": None if args.resume is None else str(args.resume),
         "output": str(args.output),
-        "architecture": "FFS_shared_S0_encoder_plus_independent_DoLP_encoders_wavelet_PIM_x4",
+        "architecture": "FFS_shared_S0_encoder_plus_independent_single_channel_DoLP_encoders_wavelet_PIM_x4",
         "fusion_source": "GatedRCCBStereo/networks/pim_fusion.py",
         "fusion": "left RGB+RGB-DoLP; right NIR+NIR-DoLP",
+        "dolp_input": "both DoLP PNGs are single-channel uint8; repeated to 3 channels only for the pretrained FFS encoder stem",
         "fine_tuning": "full model",
         "trainable_parameters": trainable,
         "total_parameters": total,
