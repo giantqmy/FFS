@@ -96,16 +96,24 @@ def parse_args() -> argparse.Namespace:
 class RGBNIRDoLPPseudoDataset(RGBNIRPseudoDisparityDataset):
     def __init__(self, *args, rgb_dolp_dir: Path, nir_dolp_dir: Path, **kwargs):
         super().__init__(*args, **kwargs)
-        rgb_suffix = "_dolp_color_rgb.png"
-        nir_suffix = "_dolp_nir.png"
-        rgb_dolp = {
-            path.name[: -len(rgb_suffix)]: path
-            for path in rgb_dolp_dir.glob(f"*{rgb_suffix}")
-        }
-        nir_dolp = {
-            path.name[: -len(nir_suffix)]: path
-            for path in nir_dolp_dir.glob(f"*{nir_suffix}")
-        }
+        def index_with_suffixes(directory: Path, suffixes: tuple[str, ...]) -> dict[str, Path]:
+            indexed = {}
+            for suffix in suffixes:
+                for path in directory.glob(f"*{suffix}"):
+                    key = path.name[: -len(suffix)]
+                    if key in indexed and indexed[key] != path:
+                        raise RuntimeError(
+                            f"Multiple DoLP files match timestamp {key}: "
+                            f"{indexed[key]} and {path}"
+                        )
+                    indexed[key] = path
+            return indexed
+
+        rgb_dolp = index_with_suffixes(
+            rgb_dolp_dir,
+            ("_dolp_rgb.png", "_dolp_color_rgb.png"),
+        )
+        nir_dolp = index_with_suffixes(nir_dolp_dir, ("_dolp_nir.png",))
         missing = []
         self.dolp_paths = []
         for sample in self.samples:
