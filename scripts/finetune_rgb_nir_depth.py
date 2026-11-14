@@ -186,7 +186,9 @@ def sequence_loss(
     valid: torch.Tensor,
     gamma: float,
 ) -> tuple[torch.Tensor, dict]:
-    total = gt_disp.sum() * 0.0
+    # Keep the zero-loss fallback connected to the model graph. This makes an
+    # empty supervision mask a differentiable no-op instead of a backward error.
+    total = init_disp.sum() * 0.0
     init_h, init_w = init_disp.shape[-2:]
     scale = init_w / float(gt_disp.shape[-1])
     init_gt = F.interpolate(gt_disp, size=(init_h, init_w), mode="nearest") * scale
@@ -473,6 +475,7 @@ def main(*, sparse_lidar_validation: bool = False) -> None:
             model.train(phase == "train")
             loss_sum = 0.0
             batches = 0
+            skipped_empty_batches = 0
             if sparse_lidar_validation:
                 totals = {
                     "count": 0, "abs_sum": 0.0, "sq_sum": 0.0,
@@ -490,6 +493,14 @@ def main(*, sparse_lidar_validation: bool = False) -> None:
                     valid = batch["valid"].to(device, non_blocking=True).bool()
                     eval_depth = batch["eval_depth"].to(device, non_blocking=True)
                     eval_valid = batch["eval_valid"].to(device, non_blocking=True).bool()
+                    if phase == "train" and not valid.any():
+                        skipped_empty_batches += 1
+                        print(
+                            f"epoch {epoch + 1}/{args.epochs} train {step}/{len(loader)} "
+                            f"skip empty sparse supervision; keys={batch['key']}",
+                            flush=True,
+                        )
+                        continue
                     if phase == "train":
                         optimizer.zero_grad(set_to_none=True)
                     init_disp, predictions = model(
@@ -529,6 +540,12 @@ def main(*, sparse_lidar_validation: bool = False) -> None:
                             f"iter_disp={details['loss_disp']:.6f}", flush=True,
                         )
             epoch_result[f"{phase}_loss"] = loss_sum / max(batches, 1)
+            if phase == "train" and skipped_empty_batches:
+                print(
+                    f"epoch {epoch + 1}/{args.epochs} train skipped "
+                    f"{skipped_empty_batches} empty-supervision batches",
+                    flush=True,
+                )
             if sparse_lidar_validation and phase == "val":
                 count = totals["count"]
                 epoch_result["val_depth_mae_m"] = (
