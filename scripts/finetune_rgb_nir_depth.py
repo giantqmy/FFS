@@ -220,6 +220,11 @@ class RGBNIRDenseDepthDataset(Dataset):
         depth_m = cv2.remap(depth_m, *self.calibration["map_left"], cv2.INTER_NEAREST)
         nir = np.repeat(nir[..., None], 3, axis=2)
 
+        decoded_valid = np.isfinite(depth_m) & (depth_m > 0.0)
+        decoded_count = int(decoded_valid.sum())
+        decoded_min_m = float(depth_m[decoded_valid].min()) if decoded_count else None
+        decoded_max_m = float(depth_m[decoded_valid].max()) if decoded_count else None
+
         if sparse_gt_path is not None and index in self.sparse_eval_indices:
             sparse_gt_u16 = cv2.imread(str(sparse_gt_path), cv2.IMREAD_UNCHANGED)
             if (
@@ -248,7 +253,14 @@ class RGBNIRDenseDepthDataset(Dataset):
             & (eval_depth_m <= self.max_depth)
         )
         eval_depth_m = np.where(eval_valid, eval_depth_m, 0.0).astype(np.float32)
-        valid = eval_valid.copy()
+        # Training supervision and validation GT are independent. In the
+        # local-depth trainer, train samples intentionally do not load sparse
+        # evaluation GT, so the disparity mask must always come from depth_m.
+        valid = (
+            np.isfinite(depth_m)
+            & (depth_m > 0.0)
+            & (depth_m <= self.max_depth)
+        )
         disparity = np.zeros_like(depth_m, dtype=np.float32)
         disparity[valid] = (
             self.calibration["fx"] * self.calibration["baseline"] / depth_m[valid]
@@ -266,6 +278,9 @@ class RGBNIRDenseDepthDataset(Dataset):
             "eval_valid": torch.from_numpy(eval_valid[None].copy()),
             "disp": torch.from_numpy(disparity[None].copy()).float(),
             "valid": torch.from_numpy(valid[None].copy()),
+            "decoded_count": decoded_count,
+            "decoded_min_m": float("nan") if decoded_min_m is None else decoded_min_m,
+            "decoded_max_m": float("nan") if decoded_max_m is None else decoded_max_m,
             "key": key,
         }
 
@@ -473,10 +488,36 @@ def main(
     save_manifest(args.output / "train.txt", dataset, train_indices)
     save_manifest(args.output / "val.txt", dataset, val_indices)
 
-    sample = dataset[train_indices[0]]
-    sample_valid_count = int(sample["valid"].sum())
-    if not sample_valid_count:
-        raise RuntimeError(f"First training sample has no valid supervised pixels: {sample['key']}")
+    sample = None
+    empty_examples = []
+    for index in train_indices:
+        candidate = dataset[index]
+        if int(candidate["valid"].sum()):
+            sample = candidate
+            break
+        if len(empty_examples) < 5:
+            empty_examples.append(
+                {
+                    "key": candidate["key"],
+                    "decoded_pixels": candidate["decoded_count"],
+                    "decoded_range_m": (
+                        candidate["decoded_min_m"], candidate["decoded_max_m"]
+                    ),
+                }
+            )
+    if sample is None:
+        raise RuntimeError(
+            "No training sample has valid supervised pixels after depth/disparity "
+            f"filtering. First empty samples: {empty_examples}; "
+            f"fx={calibration['fx']:.6f}, baseline_m={calibration['baseline']:.9f}, "
+            f"max_depth_m={args.max_depth}, max_disp_px={args.max_disp}"
+        )
+    if empty_examples:
+        print(
+            "Warning: skipped empty samples while finding a valid data example: "
+            f"{empty_examples}",
+            flush=True,
+        )
     print(
         f"seed={args.seed}, train={len(train_indices)}, val={len(val_indices)}, "
         f"left={tuple(sample['left'].shape)}, right={tuple(sample['right'].shape)}, "
