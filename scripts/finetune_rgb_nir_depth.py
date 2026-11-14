@@ -69,6 +69,7 @@ def load_calibration(path: Path) -> dict:
     baseline = float(abs(p2[0, 3] / p2[0, 0]))
     return {
         "size": (width, height), "map_left": map_left, "map_right": map_right,
+        "K_left": k_left, "dist_left": d_left, "R1": r1,
         "P1": p1, "P2": p2, "fx": float(p1[0, 0]), "baseline": baseline,
         "alpha": alpha,
     }
@@ -92,6 +93,50 @@ def index_sparse_depth_files(directory: Path) -> dict[str, Path]:
     return indexed
 
 
+def rectify_sparse_left_depth(raw_depth_m: np.ndarray, calibration: dict) -> np.ndarray:
+    """Forward-project raw left-camera depth samples onto the rectified grid."""
+    expected_w, expected_h = calibration["size"]
+    valid = np.isfinite(raw_depth_m) & (raw_depth_m > 0.0)
+    vv, uu = np.nonzero(valid)
+    rectified = np.zeros((expected_h, expected_w), dtype=np.float32)
+    if uu.size == 0:
+        return rectified
+
+    pixels = np.stack((uu, vv), axis=-1).astype(np.float64).reshape(-1, 1, 2)
+    normalized = cv2.undistortPoints(
+        pixels, calibration["K_left"], calibration["dist_left"]
+    ).reshape(-1, 2)
+    z_raw = raw_depth_m[vv, uu].astype(np.float64)
+    points_raw = np.column_stack(
+        (normalized[:, 0] * z_raw, normalized[:, 1] * z_raw, z_raw)
+    )
+    points_rectified = points_raw @ calibration["R1"].T
+    z_rectified = points_rectified[:, 2]
+    projected = points_rectified @ calibration["P1"][:, :3].T
+    finite = (
+        np.isfinite(projected).all(axis=1)
+        & np.isfinite(z_rectified)
+        & (z_rectified > 0.0)
+    )
+    projected = projected[finite]
+    z_rectified = z_rectified[finite]
+    u_rect = np.rint(projected[:, 0] / projected[:, 2]).astype(np.int64)
+    v_rect = np.rint(projected[:, 1] / projected[:, 2]).astype(np.int64)
+    inside = (
+        (u_rect >= 0) & (u_rect < expected_w)
+        & (v_rect >= 0) & (v_rect < expected_h)
+    )
+    u_rect, v_rect, z_rectified = (
+        u_rect[inside], v_rect[inside], z_rectified[inside]
+    )
+    flat = np.full(expected_h * expected_w, np.inf, dtype=np.float32)
+    np.minimum.at(
+        flat, v_rect * expected_w + u_rect, z_rectified.astype(np.float32)
+    )
+    flat[~np.isfinite(flat)] = 0.0
+    return flat.reshape(expected_h, expected_w)
+
+
 class RGBNIRDenseDepthDataset(Dataset):
     def __init__(
         self,
@@ -103,6 +148,8 @@ class RGBNIRDenseDepthDataset(Dataset):
         max_depth: float,
         sparse_depth: bool = False,
         depth_suffix: str | None = None,
+        sparse_gt_dir: Path | None = None,
+        sparse_gt_suffix: str = "_depth_gt_sparse_u16.png",
     ) -> None:
         self.calibration = calibration
         self.max_disp = float(max_disp)
@@ -115,19 +162,37 @@ class RGBNIRDenseDepthDataset(Dataset):
             depth = index_sparse_depth_files(depth_dir)
         else:
             depth = index_files(depth_dir, "_depth_dense_u16.png")
-        keys = sorted(set(rgb) & set(nir) & set(depth))
+        sparse_gt = (
+            index_files(sparse_gt_dir, sparse_gt_suffix)
+            if sparse_gt_dir is not None else None
+        )
+        keys = set(rgb) & set(nir) & set(depth)
+        if sparse_gt is not None:
+            keys &= set(sparse_gt)
+        keys = sorted(keys)
         if not keys:
             label = "sparse-depth" if sparse_depth else "dense-depth"
             raise RuntimeError(f"No matching RGB/NIR/{label} timestamp prefixes found")
-        self.samples = [(rgb[k], nir[k], depth[k], k) for k in keys]
-        counts = {"RGB": len(rgb), "NIR": len(nir), "depth": len(depth), "matched": len(keys)}
+        self.samples = [
+            (rgb[k], nir[k], depth[k], None if sparse_gt is None else sparse_gt[k], k)
+            for k in keys
+        ]
+        self.sparse_eval_indices: set[int] = set()
+        counts = {
+            "RGB": len(rgb), "NIR": len(nir), "depth": len(depth),
+            "sparse_gt": None if sparse_gt is None else len(sparse_gt),
+            "matched": len(keys),
+        }
         print(f"Dataset counts: {counts}", flush=True)
+
+    def set_sparse_eval_indices(self, indices: list[int]) -> None:
+        self.sparse_eval_indices = set(indices)
 
     def __len__(self) -> int:
         return len(self.samples)
 
     def __getitem__(self, index: int) -> dict:
-        rgb_path, nir_path, depth_path, key = self.samples[index]
+        rgb_path, nir_path, depth_path, sparse_gt_path, key = self.samples[index]
         rgb = imageio.imread(rgb_path)
         nir = imageio.imread(nir_path)
         depth_u16 = cv2.imread(str(depth_path), cv2.IMREAD_UNCHANGED)
@@ -155,8 +220,34 @@ class RGBNIRDenseDepthDataset(Dataset):
         depth_m = cv2.remap(depth_m, *self.calibration["map_left"], cv2.INTER_NEAREST)
         nir = np.repeat(nir[..., None], 3, axis=2)
 
-        eval_valid = np.isfinite(depth_m) & (depth_m > 0.0) & (depth_m <= self.max_depth)
-        eval_depth_m = np.where(eval_valid, depth_m, 0.0).astype(np.float32)
+        if sparse_gt_path is not None and index in self.sparse_eval_indices:
+            sparse_gt_u16 = cv2.imread(str(sparse_gt_path), cv2.IMREAD_UNCHANGED)
+            if (
+                sparse_gt_u16 is None
+                or sparse_gt_u16.dtype != np.uint16
+                or sparse_gt_u16.shape != (expected_h, expected_w)
+            ):
+                got = None if sparse_gt_u16 is None else (
+                    sparse_gt_u16.dtype, sparse_gt_u16.shape
+                )
+                raise ValueError(
+                    f"Sparse GT must be uint16 {expected_w}x{expected_h}: "
+                    f"{sparse_gt_path}; got {got}"
+                )
+            eval_depth_m = rectify_sparse_left_depth(
+                sparse_gt_u16.astype(np.float32) * DEPTH_METRES_PER_UINT16,
+                self.calibration,
+            )
+        elif sparse_gt_path is not None:
+            eval_depth_m = np.zeros_like(depth_m, dtype=np.float32)
+        else:
+            eval_depth_m = depth_m.copy()
+        eval_valid = (
+            np.isfinite(eval_depth_m)
+            & (eval_depth_m > 0.0)
+            & (eval_depth_m <= self.max_depth)
+        )
+        eval_depth_m = np.where(eval_valid, eval_depth_m, 0.0).astype(np.float32)
         valid = eval_valid.copy()
         disparity = np.zeros_like(depth_m, dtype=np.float32)
         disparity[valid] = (
@@ -274,10 +365,14 @@ def sparse_lidar_depth_metrics(
 
 def save_manifest(path: Path, dataset: RGBNIRDenseDepthDataset, indices: list[int]) -> None:
     with path.open("w", encoding="utf-8", newline="\n") as stream:
-        stream.write("# key\trgb\tnir\tdepth\n")
+        stream.write("# key\trgb\tnir\ttraining_depth\tsparse_eval_gt\n")
         for index in indices:
-            rgb, nir, depth, key = dataset.samples[index]
-            stream.write(f"{key}\t{rgb.resolve()}\t{nir.resolve()}\t{depth.resolve()}\n")
+            rgb, nir, depth, sparse_gt, key = dataset.samples[index]
+            sparse_text = "" if sparse_gt is None else str(sparse_gt.resolve())
+            stream.write(
+                f"{key}\t{rgb.resolve()}\t{nir.resolve()}\t{depth.resolve()}\t"
+                f"{sparse_text}\n"
+            )
 
 
 def to_yamlable(value):
@@ -301,6 +396,13 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--rgb-dir", type=Path, default=DEFAULT_RGB)
     parser.add_argument("--nir-dir", type=Path, default=DEFAULT_NIR)
     parser.add_argument("--depth-dir", type=Path, default=DEFAULT_DEPTH)
+    parser.add_argument(
+        "--sparse-gt-dir", type=Path,
+        help="Independent raw left sparse-LiDAR depth used only for validation metrics",
+    )
+    parser.add_argument(
+        "--sparse-gt-suffix", type=str, default="_depth_gt_sparse_u16.png",
+    )
     parser.add_argument("--calibration-file", type=Path, default=DEFAULT_CALIBRATION)
     parser.add_argument("--model", type=Path, default=DEFAULT_MODEL)
     parser.add_argument("--resume", type=Path)
@@ -339,14 +441,24 @@ def parse_args() -> argparse.Namespace:
     return args
 
 
-def main(*, sparse_lidar_validation: bool = False) -> None:
+def main(
+    *,
+    sparse_lidar_validation: bool = False,
+    require_independent_sparse_gt: bool = False,
+) -> None:
     args = parse_args()
+    if require_independent_sparse_gt and args.sparse_gt_dir is None:
+        raise ValueError(
+            "This training entry requires --sparse-gt-dir for independent "
+            "sparse-LiDAR validation"
+        )
     seed_everything(args.seed)
     calibration = load_calibration(args.calibration_file)
     dataset = RGBNIRDenseDepthDataset(
         args.rgb_dir, args.nir_dir, args.depth_dir, calibration,
         max_disp=args.max_disp, max_depth=args.max_depth, sparse_depth=args.sparse_depth,
-        depth_suffix=args.depth_suffix,
+        depth_suffix=args.depth_suffix, sparse_gt_dir=args.sparse_gt_dir,
+        sparse_gt_suffix=args.sparse_gt_suffix,
     )
     indices = list(range(len(dataset)))
     random.Random(args.seed).shuffle(indices)
@@ -356,6 +468,7 @@ def main(*, sparse_lidar_validation: bool = False) -> None:
         raise RuntimeError("At least two matched samples are required")
     val_count = min(len(indices) - 1, max(1, int(len(indices) * args.val_fraction)))
     val_indices, train_indices = indices[:val_count], indices[val_count:]
+    dataset.set_sparse_eval_indices(val_indices)
     args.output.mkdir(parents=True, exist_ok=True)
     save_manifest(args.output / "train.txt", dataset, train_indices)
     save_manifest(args.output / "val.txt", dataset, val_indices)
@@ -444,6 +557,9 @@ def main(*, sparse_lidar_validation: bool = False) -> None:
         **vars(args),
         "rgb_dir": str(args.rgb_dir), "nir_dir": str(args.nir_dir),
         "depth_dir": str(args.depth_dir), "model": str(args.model),
+        "sparse_gt_dir": (
+            None if args.sparse_gt_dir is None else str(args.sparse_gt_dir)
+        ),
         "resume": None if args.resume is None else str(args.resume),
         "output": str(args.output), "calibration_file": str(args.calibration_file),
         "depth_scale_m_per_uint16": DEPTH_METRES_PER_UINT16,
