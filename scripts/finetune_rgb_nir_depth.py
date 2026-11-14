@@ -518,6 +518,7 @@ def main(
             f"{empty_examples}",
             flush=True,
         )
+    sample_valid_count = int(sample["valid"].sum())
     print(
         f"seed={args.seed}, train={len(train_indices)}, val={len(val_indices)}, "
         f"left={tuple(sample['left'].shape)}, right={tuple(sample['right'].shape)}, "
