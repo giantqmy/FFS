@@ -155,7 +155,9 @@ class RGBNIRDenseDepthDataset(Dataset):
         depth_m = cv2.remap(depth_m, *self.calibration["map_left"], cv2.INTER_NEAREST)
         nir = np.repeat(nir[..., None], 3, axis=2)
 
-        valid = np.isfinite(depth_m) & (depth_m > 0.0) & (depth_m <= self.max_depth)
+        eval_valid = np.isfinite(depth_m) & (depth_m > 0.0) & (depth_m <= self.max_depth)
+        eval_depth_m = np.where(eval_valid, depth_m, 0.0).astype(np.float32)
+        valid = eval_valid.copy()
         disparity = np.zeros_like(depth_m, dtype=np.float32)
         disparity[valid] = (
             self.calibration["fx"] * self.calibration["baseline"] / depth_m[valid]
@@ -169,6 +171,8 @@ class RGBNIRDenseDepthDataset(Dataset):
             "left": torch.from_numpy(rgb.transpose(2, 0, 1).copy()).float(),
             "right": torch.from_numpy(nir.transpose(2, 0, 1).copy()).float(),
             "depth": torch.from_numpy(depth_m[None].copy()).float(),
+            "eval_depth": torch.from_numpy(eval_depth_m[None].copy()).float(),
+            "eval_valid": torch.from_numpy(eval_valid[None].copy()),
             "disp": torch.from_numpy(disparity[None].copy()).float(),
             "valid": torch.from_numpy(valid[None].copy()),
             "key": key,
@@ -222,6 +226,50 @@ def final_metrics(prediction, gt_depth, gt_disp, valid, focal_baseline) -> dict:
     }
 
 
+@torch.no_grad()
+def sparse_lidar_depth_metrics(
+    prediction_disp: torch.Tensor,
+    gt_depth: torch.Tensor,
+    gt_valid: torch.Tensor,
+    focal_baseline: float,
+    min_depth: float,
+    max_depth: float,
+) -> dict:
+    mask = (
+        gt_valid.bool()
+        & torch.isfinite(gt_depth)
+        & (gt_depth >= min_depth)
+        & (gt_depth <= max_depth)
+    )
+    count = int(mask.sum())
+    if count == 0:
+        return {
+            "count": 0, "abs_sum": 0.0, "sq_sum": 0.0,
+            "delta1": 0, "delta2": 0, "delta3": 0,
+        }
+    min_disp = float(focal_baseline) / float(max_depth)
+    max_disp = float(focal_baseline) / float(min_depth)
+    raw_disp = prediction_disp[mask].float()
+    pred_disp = torch.nan_to_num(
+        raw_disp, nan=min_disp, posinf=min_disp, neginf=min_disp,
+    ).clamp(min=min_disp, max=max_disp)
+    pred_depth = float(focal_baseline) / pred_disp
+    target_depth = gt_depth[mask].float()
+    error = pred_depth - target_depth
+    ratio = torch.maximum(
+        pred_depth / target_depth,
+        target_depth / pred_depth.clamp(min=min_depth),
+    )
+    return {
+        "count": count,
+        "abs_sum": float(error.abs().double().sum()),
+        "sq_sum": float(error.double().square().sum()),
+        "delta1": int((ratio <= 1.25).sum()),
+        "delta2": int((ratio <= 1.25 ** 2).sum()),
+        "delta3": int((ratio <= 1.25 ** 3).sum()),
+    }
+
+
 def save_manifest(path: Path, dataset: RGBNIRDenseDepthDataset, indices: list[int]) -> None:
     with path.open("w", encoding="utf-8", newline="\n") as stream:
         stream.write("# key\trgb\tnir\tdepth\n")
@@ -268,6 +316,8 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--valid-iters", type=int, default=22)
     parser.add_argument("--max-disp", type=int, default=192)
     parser.add_argument("--max-depth", type=float, default=200.0)
+    parser.add_argument("--eval-min-depth", type=float, default=0.1)
+    parser.add_argument("--eval-max-depth", type=float, default=200.0)
     parser.add_argument("--sparse-depth", action="store_true", help="Use sparse LiDAR depth files and supervise only their nonzero pixels")
     parser.add_argument("--depth-suffix", type=str, help="Exact depth filename suffix, e.g. _depth_gt_sparse_u16.png")
     parser.add_argument("--gamma", type=float, default=0.9)
@@ -282,10 +332,12 @@ def parse_args() -> argparse.Namespace:
         parser.error("feature-lr must be positive when specified")
     if not 0.0 < args.val_fraction < 1.0:
         parser.error("val-fraction must be between 0 and 1")
+    if args.eval_min_depth <= 0.0 or args.eval_max_depth <= args.eval_min_depth:
+        parser.error("Require 0 < --eval-min-depth < --eval-max-depth")
     return args
 
 
-def main() -> None:
+def main(*, sparse_lidar_validation: bool = False) -> None:
     args = parse_args()
     seed_everything(args.seed)
     calibration = load_calibration(args.calibration_file)
@@ -373,7 +425,8 @@ def main() -> None:
         optimizer.load_state_dict(checkpoint["optimizer"])
         scaler.load_state_dict(checkpoint["scaler"])
         start_epoch = int(checkpoint["epoch"])
-        best_val = float(checkpoint.get("best_val", best_val))
+        best_key = "best_val_depth_mae_m" if sparse_lidar_validation else "best_val"
+        best_val = float(checkpoint.get(best_key, best_val))
         history = list(checkpoint.get("history", []))
 
     train_loader = DataLoader(
@@ -400,6 +453,15 @@ def main() -> None:
             else "rectified depth converted to disparity; nonzero valid labels only; "
             "initial SmoothL1 plus gamma-weighted iterative L1 disparity loss"
         ),
+        "validation_metrics": (
+            "MAE, RMSE, delta1, delta2, delta3 only at nonzero validation "
+            "sparse-LiDAR ground-truth pixels"
+            if sparse_lidar_validation else "legacy label-based depth/disparity metrics"
+        ),
+        "best_model_selection": (
+            "minimum validation sparse-LiDAR depth MAE"
+            if sparse_lidar_validation else "minimum validation loss"
+        ),
     }
     (args.output / "run_config.json").write_text(
         json.dumps(run_config, indent=2, ensure_ascii=False), encoding="utf-8"
@@ -411,7 +473,13 @@ def main() -> None:
             model.train(phase == "train")
             loss_sum = 0.0
             batches = 0
-            totals = {"count": 0, "depth_abs": 0.0, "depth_sq": 0.0, "disp_abs": 0.0}
+            if sparse_lidar_validation:
+                totals = {
+                    "count": 0, "abs_sum": 0.0, "sq_sum": 0.0,
+                    "delta1": 0, "delta2": 0, "delta3": 0,
+                }
+            else:
+                totals = {"count": 0, "depth_abs": 0.0, "depth_sq": 0.0, "disp_abs": 0.0}
             context = torch.enable_grad() if phase == "train" else torch.no_grad()
             with context:
                 for step, batch in enumerate(loader, start=1):
@@ -420,6 +488,8 @@ def main() -> None:
                     gt_depth = batch["depth"].to(device, non_blocking=True)
                     gt_disp = batch["disp"].to(device, non_blocking=True)
                     valid = batch["valid"].to(device, non_blocking=True).bool()
+                    eval_depth = batch["eval_depth"].to(device, non_blocking=True)
+                    eval_valid = batch["eval_valid"].to(device, non_blocking=True).bool()
                     if phase == "train":
                         optimizer.zero_grad(set_to_none=True)
                     init_disp, predictions = model(
@@ -437,9 +507,19 @@ def main() -> None:
                         torch.nn.utils.clip_grad_norm_(model.parameters(), 1.0)
                         scaler.step(optimizer)
                         scaler.update()
-                    metrics = final_metrics(predictions[-1], gt_depth, gt_disp, valid, focal_baseline)
-                    for name in totals:
-                        totals[name] += metrics[name]
+                    if sparse_lidar_validation and phase == "val":
+                        metrics = sparse_lidar_depth_metrics(
+                            predictions[-1], eval_depth, eval_valid, focal_baseline,
+                            args.eval_min_depth, args.eval_max_depth,
+                        )
+                        for name in totals:
+                            totals[name] += metrics[name]
+                    elif not sparse_lidar_validation:
+                        metrics = final_metrics(
+                            predictions[-1], gt_depth, gt_disp, valid, focal_baseline
+                        )
+                        for name in totals:
+                            totals[name] += metrics[name]
                     loss_sum += float(loss.detach())
                     batches += 1
                     if step == 1 or step == len(loader) or step % 20 == 0:
@@ -448,20 +528,42 @@ def main() -> None:
                             f"loss={details['loss']:.6f} init_disp={details['loss_init_disp']:.6f} "
                             f"iter_disp={details['loss_disp']:.6f}", flush=True,
                         )
-            count = totals["count"]
             epoch_result[f"{phase}_loss"] = loss_sum / max(batches, 1)
-            epoch_result[f"{phase}_depth_mae_m"] = totals["depth_abs"] / count if count else None
-            epoch_result[f"{phase}_depth_rmse_m"] = (totals["depth_sq"] / count) ** 0.5 if count else None
-            epoch_result[f"{phase}_disp_mae_px"] = totals["disp_abs"] / count if count else None
-            epoch_result[f"{phase}_valid_pixels"] = count
+            if sparse_lidar_validation and phase == "val":
+                count = totals["count"]
+                epoch_result["val_depth_mae_m"] = (
+                    totals["abs_sum"] / count if count else None
+                )
+                epoch_result["val_depth_rmse_m"] = (
+                    (totals["sq_sum"] / count) ** 0.5 if count else None
+                )
+                epoch_result["val_delta1"] = totals["delta1"] / count if count else None
+                epoch_result["val_delta2"] = totals["delta2"] / count if count else None
+                epoch_result["val_delta3"] = totals["delta3"] / count if count else None
+            elif not sparse_lidar_validation:
+                count = totals["count"]
+                epoch_result[f"{phase}_depth_mae_m"] = totals["depth_abs"] / count if count else None
+                epoch_result[f"{phase}_depth_rmse_m"] = (totals["depth_sq"] / count) ** 0.5 if count else None
+                epoch_result[f"{phase}_disp_mae_px"] = totals["disp_abs"] / count if count else None
+                epoch_result[f"{phase}_valid_pixels"] = count
 
         history.append(epoch_result)
-        if epoch_result["val_loss"] < best_val:
-            best_val = epoch_result["val_loss"]
-            torch.save({
+        selection_metric = (
+            epoch_result["val_depth_mae_m"]
+            if sparse_lidar_validation else epoch_result["val_loss"]
+        )
+        if selection_metric is None:
+            raise RuntimeError("Validation produced no valid sparse-LiDAR depth pixels")
+        if selection_metric < best_val:
+            best_val = selection_metric
+            best_checkpoint = {
                 "model": model.state_dict(), "epoch": epoch + 1,
-                "val_loss": best_val, "run_config": run_config,
-            }, args.output / "best_model.pt")
+                "val_loss": epoch_result["val_loss"], "run_config": run_config,
+            }
+            if sparse_lidar_validation:
+                best_checkpoint["val_depth_mae_m"] = best_val
+                best_checkpoint["best_val_depth_mae_m"] = best_val
+            torch.save(best_checkpoint, args.output / "best_model.pt")
             # Same serialized format expected by run_demo.py/run_demo_rectified.py.
             torch.save(model, args.output / "model_best_serialize.pth")
         checkpoint = {
@@ -469,6 +571,8 @@ def main() -> None:
             "scaler": scaler.state_dict(), "epoch": epoch + 1,
             "best_val": best_val, "history": history, "run_config": run_config,
         }
+        if sparse_lidar_validation:
+            checkpoint["best_val_depth_mae_m"] = best_val
         torch.save(checkpoint, args.output / "latest.pt")
         (args.output / "history.json").write_text(
             json.dumps(history, indent=2, ensure_ascii=False), encoding="utf-8"
